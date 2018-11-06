@@ -16,199 +16,358 @@ import (
 
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/docker/api/types"
+	apiclient "github.com/docker/docker/client"
 	"github.com/docker/docker/integration-cli/daemon"
 	"github.com/docker/docker/integration-cli/registry"
 )
 
 const registryURI = "127.0.0.1:5000"
 
-// PATH=$PATH:`pwd`/balena-engine TESTDIRS="integration/image" TESTFLAGS="-test.run Delta" hack/make.sh test-integration
 func TestDelta(t *testing.T) {
-	type testCase struct {
-		desc           string
-		base           string
-		target         string
-		delta          string
-		expectedImages []string
+	var (
+		base           = "busybox:1.24"
+		target         = "busybox:1.29"
+		delta          = fmt.Sprintf("%s/busybox:delta-1.24-1.29", registryURI)
+		expectedImages = []string{
+			"sha256:47bcc53f74dc94b1920f0b34f6036096526296767650f223433fe65c35f149eb", // busybox:1.24
+			"sha256:59788edf1f3e78cd0ebe6ce1446e9d10788225db3dedcfd1a59f764bad2b2690", // busybox:1.29
+		}
+	)
+
+	var (
+		err    error
+		rc     io.ReadCloser
+		ctx    = context.Background()
+		client = testEnv.APIClient()
+	)
+
+	pullDeltaImages(t, client, base, target)
+
+	t.Log("Creating delta")
+	rc, err = client.ImageDelta(ctx,
+		base,
+		target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deltaID := parseDeltaImageID(t, rc)
+	expectedImages = append(expectedImages, deltaID)
+	rc.Close()
+
+	err = client.ImageTag(ctx, deltaID, delta)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	for _, c := range []testCase{
-		{
-			desc:           "busybox images",
-			base:           "busybox:1.24",
-			target:         "busybox:1.29",
-			delta:          fmt.Sprintf("%s/delta-test:1.24-1.29", registryURI),
-			expectedImages: []string{"busybox:1.24", fmt.Sprintf("%s/delta-test:1.24-1.29", registryURI)},
-		},
-	} {
-		t.Run(c.desc, func(t *testing.T) {
-			c := c
+	t.Log("Listing host images")
+	listImages(t, client)
 
-			var (
-				err error
-				rc  io.ReadCloser
-			)
+	hasImages(t, client, expectedImages)
+}
 
-			d := daemon.New(t, "", "balena-engine-daemon", daemon.Config{})
-			client, err := d.NewClient()
-			if err != nil {
-				t.Fatal(err)
+func TestDeltaWithRegistry(t *testing.T) {
+	var (
+		base           = "busybox:1.24"
+		target         = "busybox:1.29"
+		delta          = fmt.Sprintf("%s/busybox:delta-1.24-1.29", registryURI)
+		expectedImages = []string{
+			"sha256:47bcc53f74dc94b1920f0b34f6036096526296767650f223433fe65c35f149eb", // busybox:1.24
+		}
+	)
+
+	var (
+		err    error
+		rc     io.ReadCloser
+		ctx    = context.Background()
+		client = testEnv.APIClient()
+	)
+
+	reg, err := registry.NewV2(false, "htpasswd", "", registryURI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+
+	pullDeltaImages(t, client, base, target)
+
+	t.Log("Creating delta")
+	rc, err = client.ImageDelta(ctx,
+		base,
+		target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deltaID := parseDeltaImageID(t, rc)
+	expectedImages = append(expectedImages, deltaID)
+	rc.Close()
+
+	err = client.ImageTag(ctx, deltaID, delta)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("Pushing delta to local registry")
+	encodedAuth, err := command.EncodeAuthToBase64(types.AuthConfig{
+		Username: reg.Username(),
+		Password: reg.Password(),
+		Auth:     "htpasswd",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err = client.ImagePush(ctx, delta, types.ImagePushOptions{
+		RegistryAuth: encodedAuth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(ioutil.Discard, rc)
+	rc.Close()
+
+	t.Log("Removing delta target from host")
+	_, err = client.ImageRemove(ctx, target, types.ImageRemoveOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("Pulling delta from local registry")
+	rc, err = client.ImagePull(ctx, delta, types.ImagePullOptions{
+		RegistryAuth: encodedAuth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parseCmdOutputForError(t, rc)
+	rc.Close()
+
+	t.Log("Listing host images")
+	listImages(t, client)
+
+	hasImages(t, client, expectedImages)
+}
+
+// PATH=$PATH:`pwd`/balena-engine TESTDIRS="integration/image" TESTFLAGS="-test.run Delta" hack/make.sh test-integration
+func TestDeltaWithRegistryUsingSeparateDeltaStore(t *testing.T) {
+	var (
+		base           = "busybox:1.24"
+		target         = "busybox:1.29"
+		delta          = fmt.Sprintf("%s/busybox:delta-1.24-1.29", registryURI)
+		expectedImages = []string{
+			"sha256:59788edf1f3e78cd0ebe6ce1446e9d10788225db3dedcfd1a59f764bad2b2690", // busybox:1.29
+		}
+	)
+
+	var (
+		err error
+		rc  io.ReadCloser
+		ctx = context.Background()
+	)
+
+	d := daemon.New(t, "", "balena-engine-daemon", daemon.Config{})
+	client, err := d.NewClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var args = []string{
+		"--insecure-registry=" + registryURI,
+		"--debug",
+	}
+
+	d.Start(t, args...)
+	defer d.Stop(t)
+
+	reg, err := registry.NewV2(false, "htpasswd", "", registryURI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+
+	pullDeltaImages(t, client, base, target)
+
+	t.Log("Creating delta")
+	rc, err = client.ImageDelta(ctx,
+		base,
+		target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deltaID := parseDeltaImageID(t, rc)
+	rc.Close()
+
+	err = client.ImageTag(ctx, deltaID, delta)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("Pushing delta to local registry")
+	encodedAuth, err := command.EncodeAuthToBase64(types.AuthConfig{
+		Username: reg.Username(),
+		Password: reg.Password(),
+		Auth:     "htpasswd",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err = client.ImagePush(ctx, delta, types.ImagePushOptions{
+		RegistryAuth: encodedAuth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(ioutil.Discard, rc)
+	rc.Close()
+
+	t.Log("Listing local images")
+	listImages(t, client)
+
+	t.Log("Stopping daemon")
+	d.Stop(t)
+
+	args = append(args, []string{
+		fmt.Sprintf("--delta-data-root=%s", d.Root),
+		fmt.Sprintf("--delta-storage-driver=%s", os.Getenv("DOCKER_GRAPHDRIVER")),
+	}...)
+	var newRootDir = fmt.Sprintf("%s/root-before", d.Folder)
+	d.Root = newRootDir
+
+	t.Log("Starting daemon with separate delta-data-root")
+	d.Start(t, args...)
+
+	t.Log("Pulling delta from local registry")
+	rc, err = client.ImagePull(ctx, delta, types.ImagePullOptions{
+		RegistryAuth: encodedAuth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parseCmdOutputForError(t, rc)
+	rc.Close()
+
+	hasImages(t, client, expectedImages)
+}
+
+func pullDeltaImages(t *testing.T, client apiclient.APIClient, base, target string) {
+	var (
+		err error
+		rc  io.ReadCloser
+		ctx = context.Background()
+	)
+
+	t.Log("Pulling delta base")
+	rc, err = client.ImagePull(ctx,
+		base,
+		types.ImagePullOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(ioutil.Discard, rc)
+	rc.Close()
+
+	t.Log("Pulling delta target")
+	rc, err = client.ImagePull(ctx,
+		target,
+		types.ImagePullOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(ioutil.Discard, rc)
+	rc.Close()
+}
+
+var digestRe = regexp.MustCompile("sha256:([a-fA-F0-9]{64})$")
+
+func parseDeltaImageID(t *testing.T, deltaCmdOutput io.Reader) (digest string) {
+	sc := bufio.NewScanner(deltaCmdOutput)
+	for sc.Scan() {
+		var v map[string]interface{}
+		if err := json.Unmarshal(sc.Bytes(), &v); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := v["errorDetail"]; ok {
+			t.Fatal(errors.New(v["errorDetail"].(string)))
+		}
+		_, ok := v["progressDetail"]
+		if ok {
+			continue
+		}
+		s, ok := v["status"]
+		if !ok {
+			continue
+		}
+		status, ok := s.(string)
+		if !ok {
+			continue
+		}
+		r := digestRe.FindStringSubmatch(status)
+		if len(r) < 1 {
+			continue
+		}
+		digest = r[0]
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if digest == "" {
+		t.Fatal("Unable to parse delta image id from progress output")
+	}
+	return digest
+}
+
+func hasImages(t *testing.T, client apiclient.APIClient, contains []string) (ok bool) {
+	var (
+		err  error
+		list []types.ImageSummary
+		ctx  = context.Background()
+	)
+
+	list, err = client.ImageList(ctx, types.ImageListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foundImages []string
+	for _, im := range list {
+		foundImages = append(foundImages, im.ID)
+	}
+
+	for _, im := range contains {
+		assert.Contains(t, foundImages, im)
+	}
+	return true
+}
+
+// nice to have for debugging
+func listImages(t *testing.T, client apiclient.APIClient) {
+	var (
+		err  error
+		list []types.ImageSummary
+		ctx  = context.Background()
+	)
+
+	list, err = client.ImageList(ctx, types.ImageListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, im := range list {
+		t.Logf("%v: %v", im.ID, im.RepoTags)
+	}
+}
+
+// nice to have for debugging
+func parseCmdOutputForError(t *testing.T, cmdOutput io.Reader) {
+	sc := bufio.NewScanner(cmdOutput)
+	for sc.Scan() {
+		var v map[string]interface{}
+		if err := json.Unmarshal(sc.Bytes(), &v); err != nil {
+			t.Fatal(err)
+		}
+		if e, ok := v["errorDetail"]; ok {
+			err, ok := e.(map[string]interface{})
+			if !ok {
+				t.Fail()
+				break
 			}
-
-			var args = []string{}
-
-			d.Start(t, args...)
-			defer d.Stop(t)
-			ctx := context.Background()
-
-			reg, err := registry.NewV2(false, "htpasswd", "", registryURI)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer reg.Close()
-
-			t.Log("Pulling delta base")
-			rc, err = client.ImagePull(ctx,
-				c.base,
-				types.ImagePullOptions{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			io.Copy(ioutil.Discard, rc)
-			rc.Close()
-
-			t.Log("Pulling delta target")
-			rc, err = client.ImagePull(ctx,
-				c.target,
-				types.ImagePullOptions{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			io.Copy(ioutil.Discard, rc)
-			rc.Close()
-
-			t.Log("Creating delta")
-			var deltaID string
-			rc, err = client.ImageDelta(ctx,
-				c.base,
-				c.target)
-			if err != nil {
-				t.Fatal(err)
-			}
-			{
-				re := regexp.MustCompile("sha256:([a-fA-F0-9]{64})$")
-				sc := bufio.NewScanner(rc)
-				for sc.Scan() {
-					var v map[string]interface{}
-					if err := json.Unmarshal(sc.Bytes(), &v); err != nil {
-						t.Fatal(err)
-					}
-					if _, ok := v["errorDetail"]; ok {
-						t.Fatal(errors.New(v["errorDetail"].(string)))
-					}
-					_, ok := v["progressDetail"]
-					if ok {
-						continue
-					}
-					s, ok := v["status"]
-					if !ok {
-						continue
-					}
-					status, ok := s.(string)
-					if !ok {
-						continue
-					}
-					r := re.FindStringSubmatch(status)
-					if len(r) < 1 {
-						continue
-					}
-					deltaID = r[0]
-				}
-				if err := sc.Err(); err != nil {
-					t.Fatal(err)
-				}
-				if deltaID == "" {
-					t.Fatal("Unable to parse delta image id from progress output")
-				}
-			}
-			rc.Close()
-
-			err = client.ImageTag(ctx, deltaID, c.delta)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			t.Log("Pushing delta to local registry")
-			encodedAuth, err := command.EncodeAuthToBase64(types.AuthConfig{
-				Username: reg.Username(),
-				Password: reg.Password(),
-				Auth:     "htpasswd",
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			rc, err = client.ImagePush(ctx, c.delta, types.ImagePushOptions{
-				RegistryAuth: encodedAuth,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			io.Copy(ioutil.Discard, rc)
-			rc.Close()
-
-			t.Log("Stopping daemon")
-			d.Stop(t)
-
-			args = append(args, []string{
-				fmt.Sprintf("--delta-data-root=%s", d.Root),
-				fmt.Sprintf("--delta-storage-driver=%s", os.Getenv("DOCKER_GRAPHDRIVER")),
-			}...)
-			var newRootDir = fmt.Sprintf("%s/root-before", d.Folder)
-			d.Root = newRootDir
-
-			t.Log("Starting daemon with separate delta-data-root")
-			d.Start(t, args...)
-
-			t.Log("Pulling delta from local registry")
-			rc, err = client.ImagePull(ctx, c.delta, types.ImagePullOptions{
-				RegistryAuth: encodedAuth,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			{
-				sc := bufio.NewScanner(rc)
-				for sc.Scan() {
-					var v map[string]interface{}
-					if err := json.Unmarshal(sc.Bytes(), &v); err != nil {
-						t.Fatal(err)
-					}
-					if e, ok := v["errorDetail"]; ok {
-						err, ok := e.(map[string]interface{})
-						if !ok {
-							t.Fail()
-							break
-						}
-						t.Fatal(err["message"])
-					}
-				}
-			}
-			rc.Close()
-
-			t.Log("Listing local images")
-			// we need to check if the pull applied the delta cleanly
-			var list []types.ImageSummary
-			list, err = client.ImageList(ctx, types.ImageListOptions{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			var foundImages []string
-			for _, im := range list {
-				t.Logf("%v, %v, %v", im.ID, im.Labels, im.RepoTags)
-				foundImages = append(foundImages, im.RepoTags...)
-			}
-
-			assert.Equal(t, c.expectedImages, foundImages)
-		})
+			t.Fatal(err["message"])
+		}
 	}
 }
