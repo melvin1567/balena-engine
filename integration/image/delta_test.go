@@ -58,6 +58,7 @@ func TestDelta(t *testing.T) {
 			var args = []string{}
 
 			d.Start(t, args...)
+			defer d.Stop(t)
 			ctx := context.Background()
 
 			reg, err := registry.NewV2(false, "htpasswd", "", registryURI)
@@ -167,7 +168,6 @@ func TestDelta(t *testing.T) {
 
 			t.Log("Starting daemon with separate delta-data-root")
 			d.Start(t, args...)
-			defer d.Stop(t)
 
 			t.Log("Pulling delta from local registry")
 			rc, err = client.ImagePull(ctx, c.delta, types.ImagePullOptions{
