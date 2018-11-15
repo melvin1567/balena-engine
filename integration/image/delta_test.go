@@ -62,7 +62,7 @@ func TestDelta(t *testing.T) {
 	t.Log("Listing host images")
 	listImages(t, client)
 
-	hasImages(t, client, expectedImages)
+	assert.True(t, hasImages(client, expectedImages))
 }
 
 func TestDeltaWithRegistry(t *testing.T) {
@@ -143,7 +143,7 @@ func TestDeltaWithRegistry(t *testing.T) {
 	t.Log("Listing host images")
 	listImages(t, client)
 
-	hasImages(t, client, expectedImages)
+	assert.True(t, hasImages(client, expectedImages))
 }
 
 // PATH=$PATH:`pwd`/balena-engine TESTDIRS="integration/image" TESTFLAGS="-test.run Delta" hack/make.sh test-integration
@@ -244,7 +244,7 @@ func TestDeltaWithRegistryUsingSeparateDeltaStore(t *testing.T) {
 	parseCmdOutputForError(t, rc)
 	rc.Close()
 
-	hasImages(t, client, expectedImages)
+	assert.True(t, hasImages(client, expectedImages))
 }
 
 func pullDeltaImages(t *testing.T, client apiclient.APIClient, base, target string) {
@@ -314,7 +314,7 @@ func parseDeltaImageID(t *testing.T, deltaCmdOutput io.Reader) (digest string) {
 	return digest
 }
 
-func hasImages(t *testing.T, client apiclient.APIClient, contains []string) (ok bool) {
+func hasImages(client apiclient.APIClient, imageIDs []string) (ok bool) {
 	var (
 		err  error
 		list []types.ImageSummary
@@ -323,15 +323,18 @@ func hasImages(t *testing.T, client apiclient.APIClient, contains []string) (ok 
 
 	list, err = client.ImageList(ctx, types.ImageListOptions{})
 	if err != nil {
-		t.Fatal(err)
+		return false
 	}
-	var foundImages []string
+	var foundImageIDs []string
 	for _, im := range list {
-		foundImages = append(foundImages, im.ID)
+		foundImageIDs = append(foundImageIDs, im.ID)
 	}
 
-	for _, im := range contains {
-		assert.Contains(t, foundImages, im)
+	for _, id := range imageIDs {
+		// if !assert.Contains(nil, foundImageIDs, id) {
+		if assert.Contains(nil, foundImageIDs, id) {
+			return false
+		}
 	}
 	return true
 }
